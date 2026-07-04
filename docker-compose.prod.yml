@@ -1,0 +1,137 @@
+# Kingsmarque — PRODUCTION stack (Part 19).
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d
+#
+# Topology: `proxy` is the ONLY service with host ports; it terminates TLS
+# and routes /api -> backend, everything else -> frontend. PostgreSQL and
+# Ollama are reachable solely on the internal network.
+#
+# Logging: everything writes to stdout; the json-file driver below caps
+# per-container logs at 10 MB x 5 files so logs can never fill the disk.
+# Read with `docker compose -f docker-compose.prod.yml logs -f <service>`.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  proxy:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      KMQ_DOMAIN: ${KMQ_DOMAIN:?set in .env.production}
+    volumes:
+      # templates dir => the official image envsubsts ${KMQ_DOMAIN} at start
+      - ./deploy/nginx/proxy.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - certs:/etc/nginx/certs:ro
+      - certbot_www:/var/www/certbot:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--no-check-certificate", "--spider",
+             "https://localhost/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  certbot:
+    # Renewal sidecar: checks twice daily; certbot only renews when <30 days
+    # remain. First issuance is scripts/init-letsencrypt.sh (see DEPLOYMENT.md).
+    # LAN/offline deployments: use scripts/gen-self-signed.sh and remove this
+    # service.
+    image: certbot/certbot
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - certs:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    entrypoint: >-
+      /bin/sh -c 'trap exit TERM;
+      while :; do certbot renew --webroot -w /var/www/certbot --quiet;
+      sleep 12h & wait $${!}; done'
+
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${KMQ_DB_USER:?set in .env.production}
+      POSTGRES_PASSWORD: ${KMQ_DB_PASSWORD:?set in .env.production}
+      POSTGRES_DB: ${KMQ_DB_NAME:?set in .env.production}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${KMQ_DB_USER} -d ${KMQ_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # no host ports: DB is internal-only
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    logging: *default-logging
+    env_file: .env.production
+    environment:
+      KMQ_DATABASE_URL: postgresql+asyncpg://${KMQ_DB_USER}:${KMQ_DB_PASSWORD}@db:5432/${KMQ_DB_NAME}
+      KMQ_AI_BASE_URL: http://ollama:11434
+      KMQ_STORAGE_LOCAL_ROOT: /data/storage
+      KMQ_MIGRATE_ON_START: "true"   # single backend container: safe (see entrypoint)
+    volumes:
+      - doc_storage:/data/storage    # uploaded documents persist across deploys
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    healthcheck:
+      # python is guaranteed in-image; no extra packages for a healthcheck
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # no host ports in production: only the proxy reaches the backend
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "--version"]
+      interval: 30s
+      retries: 10
+    # GPU hosts: uncomment to pass the NVIDIA runtime through.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      - backend
+    # no host ports: served through the proxy
+
+volumes:
+  pgdata: {}
+  ollama_models: {}
+  doc_storage: {}
+  certs: {}
+  certbot_www: {}

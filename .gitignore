@@ -1,0 +1,25 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# node
+node_modules/
+dist/
+
+# env & local data
+.env
+*.local
+backend/var/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+
+# tool caches
+.pytest_cache/
+.ruff_cache/
+tsconfig.tsbuildinfo

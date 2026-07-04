@@ -1,0 +1,60 @@
+# Stack: PostgreSQL + backend + frontend + Ollama (local AI).
+# SECURITY: the ollama service exposes NO host ports — it is reachable only
+# on the internal compose network, so browsers/frontend physically cannot
+# talk to it. All AI traffic is brokered by the FastAPI backend.
+services:
+  db:
+    image: pgvector/pgvector:pg16  # PostgreSQL 16 + pgvector extension (Part 9)
+    environment:
+      POSTGRES_USER: ${KMQ_DB_USER:?set in .env}
+      POSTGRES_PASSWORD: ${KMQ_DB_PASSWORD:?set in .env}
+      POSTGRES_DB: ${KMQ_DB_NAME:?set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${KMQ_DB_USER}"]
+      interval: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    env_file: .env
+    environment:
+      KMQ_DATABASE_URL: postgresql+asyncpg://${KMQ_DB_USER}:${KMQ_DB_PASSWORD}@db:5432/${KMQ_DB_NAME}
+      KMQ_AI_BASE_URL: http://ollama:11434
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    ports:
+      - "8000:8000"
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_models:/root/.ollama
+    # no `ports:` on purpose — backend-only access via the compose network
+    healthcheck:
+      test: ["CMD", "ollama", "--version"]
+      interval: 10s
+      retries: 10
+    # GPU deployments: uncomment to pass the NVIDIA runtime through.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+
+volumes:
+  pgdata: {}
+  ollama_models: {}
